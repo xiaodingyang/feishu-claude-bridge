@@ -99,9 +99,41 @@ python cli.py uninstall
 | `FEISHU_APP_SECRET` | ✅ | - | 飞书应用 App Secret |
 | `CLAUDE_CLI` | | `claude` | Claude Code CLI 路径，不在 PATH 时填完整路径 |
 | `WORK_DIR` | | `.` | Claude Code 工作目录 |
-| `TASK_TIMEOUT` | | `180` | 任务超时（秒） |
+| `TASK_TIMEOUT` | | `300` | 任务超时（秒），建议 300 秒（5 分钟） |
 | `MAX_OUTPUT_LENGTH` | | `3500` | 最大输出长度（超出截断） |
 | `MAX_TURNS` | | `30` | Claude 最大对话轮次 |
+
+## 新功能 ✨
+
+### 自动重连机制
+- WebSocket 断开后自动重连（最多 10 次）
+- 指数退避策略，避免频繁重试
+
+### 日志轮转
+- 自动切割日志文件（单文件最大 10MB）
+- 保留最近 5 个备份
+- 防止日志文件无限增长
+
+### 健康检查
+- 每 5 分钟自动心跳检查
+- 记录进程状态和异常
+
+### 增强错误日志
+- 详细记录 WebSocket 异常
+- Claude CLI 调用失败时记录完整错误
+- 分级日志（INFO/WARNING/ERROR）
+
+## 管理脚本
+
+### Windows 快捷脚本
+
+```bash
+# 重启机器人（停止旧进程 + 启动新进程）
+restart.bat
+
+# 查看状态（进程、配置、最近日志）
+status.bat
+```
 
 ## 常见问题
 

@@ -14,7 +14,9 @@ import sys
 import os
 import time
 import logging
+import uuid
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import *
@@ -31,6 +33,11 @@ logger = None
 health_check_thread = None
 reconnect_attempts = 0
 MAX_RECONNECT_ATTEMPTS = 10
+
+# 会话管理
+user_sessions = {}  # {user_id: session_id}
+sessions_lock = threading.Lock()
+sessions_file = None
 
 
 def setup_logger(log_file):
@@ -75,15 +82,66 @@ def strip_ansi(text: str) -> str:
     return text
 
 
+# ============ 会话管理 ============
+def load_sessions():
+    """加载会话映射"""
+    global user_sessions
+    if sessions_file and os.path.exists(sessions_file):
+        try:
+            with open(sessions_file, 'r', encoding='utf-8') as f:
+                user_sessions = json.load(f)
+            log(f"[session] 加载 {len(user_sessions)} 个会话")
+        except Exception as e:
+            log(f"[session] 加载失败: {e}", "warning")
+            user_sessions = {}
+
+
+def save_sessions():
+    """保存会话映射"""
+    if sessions_file:
+        try:
+            with open(sessions_file, 'w', encoding='utf-8') as f:
+                json.dump(user_sessions, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            log(f"[session] 保存失败: {e}", "error")
+
+
+def get_or_create_session(user_id: str) -> str:
+    """获取或创建用户的会话 ID"""
+    with sessions_lock:
+        if user_id not in user_sessions:
+            session_id = str(uuid.uuid4())
+            user_sessions[user_id] = session_id
+            save_sessions()
+            log(f"[session] 新建会话: {user_id[:8]}... -> {session_id[:8]}...")
+        return user_sessions[user_id]
+
+
+def reset_session(user_id: str) -> str:
+    """重置用户会话"""
+    with sessions_lock:
+        session_id = str(uuid.uuid4())
+        user_sessions[user_id] = session_id
+        save_sessions()
+        log(f"[session] 重置会话: {user_id[:8]}... -> {session_id[:8]}...")
+        return session_id
+
+
 # ============ Claude Code CLI ============
-def call_claude(prompt, cfg):
+def call_claude(prompt, cfg, session_id=None):
     cmd = [
-        cfg["claude_cli"], "--print",
+        cfg["claude_cli"],
         "--output-format", "text",
         "--max-turns", str(cfg["max_turns"]),
         "--dangerously-skip-permissions",
-        prompt,
     ]
+
+    # 如果有 session_id，使用会话模式；否则使用 --print 单次模式
+    if session_id:
+        cmd.extend(["--print", "--session-id", session_id, prompt])
+    else:
+        cmd.extend(["--print", prompt])
+
     try:
         kwargs = {}
         if sys.platform == "win32":
@@ -95,10 +153,18 @@ def call_claude(prompt, cfg):
         )
         out = r.stdout.decode("utf-8", errors="replace").strip()
         out = strip_ansi(out)
-        if not out and r.stderr:
+        
+        # 检查 stderr 中的错误
+        if r.stderr:
             err = r.stderr.decode("utf-8", errors="replace").strip()
-            log(f"[claude] stderr: {err[:500]}", "error")
-            out = f"[stderr] {err[:300]}"
+            # 检测 session 冲突错误
+            if "already in use" in err:
+                log(f"[claude] Session 冲突，返回特殊标记", "warning")
+                return "__SESSION_CONFLICT__"
+            if not out:
+                log(f"[claude] stderr: {err[:500]}", "error")
+                out = f"[stderr] {err[:300]}"
+        
         if not out:
             out = "(无输出)"
         log(f"[claude] reply: {out[:100]}")
@@ -170,7 +236,16 @@ def on_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         rid = msg.chat_id
         rid_type = "chat_id"
 
+    # 获取用户 ID（用于会话管理）
+    user_id = sender.sender_id.open_id
+
     log(f"[msg] {text[:80]}")
+
+    # 检查特殊命令
+    if text.lower() in ["/reset", "/new", "/clear", "重置", "重新开始", "清除会话"]:
+        reset_session(user_id)
+        reply_text(rid, rid_type, "✅ 已重置会话，开始新的对话")
+        return
 
     with task_lock:
         if task_running:
@@ -179,8 +254,18 @@ def on_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         task_running = True
 
     try:
+        # 获取或创建会话 ID
+        session_id = get_or_create_session(user_id)
+
         reply_text(rid, rid_type, "处理中...")
-        result = call_claude(text, _cfg)
+        result = call_claude(text, _cfg, session_id=session_id)
+        
+        # 检测到 session 冲突，自动重置并重试
+        if result == "__SESSION_CONFLICT__":
+            log(f"[session] 检测到冲突，重置会话并重试")
+            session_id = reset_session(user_id)
+            result = call_claude(text, _cfg, session_id=session_id)
+        
         reply_text(rid, rid_type, result)
         log(f"[done] {len(result)} 字")
     except Exception as e:
@@ -216,11 +301,15 @@ _cfg = {}
 
 def run(cfg: dict):
     """启动飞书机器人（带重连机制）"""
-    global client, _cfg, health_check_thread, reconnect_attempts
+    global client, _cfg, health_check_thread, reconnect_attempts, sessions_file
     _cfg = cfg
 
     # 设置日志
     setup_logger(cfg.get("log_file", "bot.log"))
+
+    # 设置会话文件路径
+    sessions_file = os.path.join(os.path.dirname(cfg.get("log_file", "bot.log")), "sessions.json")
+    load_sessions()
 
     # 写 PID 文件
     pid_file = cfg.get("pid_file")
@@ -234,6 +323,7 @@ def run(cfg: dict):
     log(f"Claude CLI: {cfg['claude_cli']}")
     log(f"任务超时: {cfg['task_timeout']}s")
     log(f"最大输出: {cfg['max_output_length']} 字符")
+    log(f"会话文件: {sessions_file}")
     log("=" * 40)
 
     # 启动健康检查线程

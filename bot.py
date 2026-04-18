@@ -129,6 +129,10 @@ def reset_session(user_id: str) -> str:
 
 # ============ Claude Code CLI ============
 def call_claude(prompt, cfg, session_id=None):
+    """调用 Claude Code CLI
+    
+    使用交互式 session 模式而不是 --print，避免 session 冲突
+    """
     cmd = [
         cfg["claude_cli"],
         "--output-format", "text",
@@ -136,32 +140,42 @@ def call_claude(prompt, cfg, session_id=None):
         "--dangerously-skip-permissions",
     ]
 
-    # 如果有 session_id，使用会话模式；否则使用 --print 单次模式
+    # 使用 session 模式（不加 --print）
     if session_id:
-        cmd.extend(["--print", "--session-id", session_id, prompt])
-    else:
-        cmd.extend(["--print", prompt])
+        cmd.extend(["--session-id", session_id])
 
     try:
         kwargs = {}
         if sys.platform == "win32":
             kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
-        r = subprocess.run(
-            cmd, capture_output=True,
-            timeout=cfg["task_timeout"], cwd=cfg["work_dir"],
+        
+        # 使用 Popen 进行交互式输入输出
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=cfg["work_dir"],
             **kwargs,
         )
-        out = r.stdout.decode("utf-8", errors="replace").strip()
+        
+        # 发送提示词并关闭输入
+        stdout, stderr = proc.communicate(input=prompt.encode('utf-8'), timeout=cfg["task_timeout"])
+        
+        out = stdout.decode("utf-8", errors="replace").strip()
         out = strip_ansi(out)
         
         # 检查 stderr 中的错误
-        if r.stderr:
-            err = r.stderr.decode("utf-8", errors="replace").strip()
-            # 检测 session 冲突错误
-            if "already in use" in err:
-                log(f"[claude] Session 冲突，返回特殊标记", "warning")
-                return "__SESSION_CONFLICT__"
-            if not out:
+        if stderr:
+            err = stderr.decode("utf-8", errors="replace").strip()
+            # 检测 session 相关错误
+            if "already in use" in err or "Session ID" in err:
+                log(f"[claude] Session 错误: {err[:200]}", "warning")
+                return "__SESSION_ERROR__"
+            if "not found" in err.lower() and "session" in err.lower():
+                log(f"[claude] Session 不存在: {err[:200]}", "warning")
+                return "__SESSION_NOT_FOUND__"
+            if not out and err:
                 log(f"[claude] stderr: {err[:500]}", "error")
                 out = f"[stderr] {err[:300]}"
         
@@ -172,6 +186,8 @@ def call_claude(prompt, cfg, session_id=None):
         return out[:max_len] + "\n...(截断)" if len(out) > max_len else out
     except subprocess.TimeoutExpired:
         log(f"[claude] 超时 ({cfg['task_timeout']}s)", "warning")
+        if 'proc' in locals():
+            proc.kill()
         return f"⏰ 超时 ({cfg['task_timeout']}s)"
     except FileNotFoundError:
         log(f"[claude] 找不到命令: {cfg['claude_cli']}", "error")
@@ -260,9 +276,13 @@ def on_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         reply_text(rid, rid_type, "处理中...")
         result = call_claude(text, _cfg, session_id=session_id)
         
-        # 检测到 session 冲突，自动重置并重试
-        if result == "__SESSION_CONFLICT__":
-            log(f"[session] 检测到冲突，重置会话并重试")
+        # 处理 session 错误
+        if result == "__SESSION_ERROR__":
+            log(f"[session] Session 错误，重置会话并重试")
+            session_id = reset_session(user_id)
+            result = call_claude(text, _cfg, session_id=session_id)
+        elif result == "__SESSION_NOT_FOUND__":
+            log(f"[session] Session 不存在，创建新会话并重试")
             session_id = reset_session(user_id)
             result = call_claude(text, _cfg, session_id=session_id)
         

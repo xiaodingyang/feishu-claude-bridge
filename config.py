@@ -61,6 +61,10 @@ def load_config() -> dict:
         "max_turns": int(os.getenv("MAX_TURNS", "30")),
         "log_file": str(BASE_DIR / "bot.log"),
         "pid_file": str(BASE_DIR / "bot.pid"),
+        # Anthropic API 配置
+        "anthropic_api_key": os.getenv("ANTHROPIC_API_KEY", "sk-d18945d49fc81d53aa9b4d0370807b53078a5fb1927dbe416155dc54dbd056e8"),
+        "anthropic_base_url": os.getenv("ANTHROPIC_BASE_URL", "https://cc-vibe.com"),
+        "anthropic_model": os.getenv("ANTHROPIC_MODEL", "claude-opus-4-6"),
     }
 
     return cfg

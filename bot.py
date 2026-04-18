@@ -15,6 +15,7 @@ import os
 import time
 import logging
 import uuid
+import anthropic
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -35,9 +36,10 @@ reconnect_attempts = 0
 MAX_RECONNECT_ATTEMPTS = 10
 
 # 会话管理
-user_sessions = {}  # {user_id: session_id}
+user_sessions = {}  # {user_id: {"session_id": str, "history": [{"role": str, "content": str}]}}
 sessions_lock = threading.Lock()
 sessions_file = None
+MAX_HISTORY_TURNS = 10  # 最多保留 10 轮对话
 
 
 def setup_logger(log_file):
@@ -89,7 +91,16 @@ def load_sessions():
     if sessions_file and os.path.exists(sessions_file):
         try:
             with open(sessions_file, 'r', encoding='utf-8') as f:
-                user_sessions = json.load(f)
+                data = json.load(f)
+            # 兼容旧格式（只有 session_id 字符串）
+            for user_id, value in data.items():
+                if isinstance(value, str):
+                    user_sessions[user_id] = {
+                        "session_id": value,
+                        "history": []
+                    }
+                else:
+                    user_sessions[user_id] = value
             log(f"[session] 加载 {len(user_sessions)} 个会话")
         except Exception as e:
             log(f"[session] 加载失败: {e}", "warning")
@@ -106,95 +117,99 @@ def save_sessions():
             log(f"[session] 保存失败: {e}", "error")
 
 
-def get_or_create_session(user_id: str) -> str:
-    """获取或创建用户的会话 ID"""
+def get_or_create_session(user_id: str) -> dict:
+    """获取或创建用户的会话数据"""
     with sessions_lock:
         if user_id not in user_sessions:
             session_id = str(uuid.uuid4())
-            user_sessions[user_id] = session_id
+            user_sessions[user_id] = {
+                "session_id": session_id,
+                "history": []
+            }
             save_sessions()
             log(f"[session] 新建会话: {user_id[:8]}... -> {session_id[:8]}...")
         return user_sessions[user_id]
 
 
-def reset_session(user_id: str) -> str:
+def reset_session(user_id: str) -> dict:
     """重置用户会话"""
     with sessions_lock:
         session_id = str(uuid.uuid4())
-        user_sessions[user_id] = session_id
+        user_sessions[user_id] = {
+            "session_id": session_id,
+            "history": []
+        }
         save_sessions()
         log(f"[session] 重置会话: {user_id[:8]}... -> {session_id[:8]}...")
-        return session_id
+        return user_sessions[user_id]
+
+
+def add_to_history(user_id: str, role: str, content: str):
+    """添加消息到对话历史"""
+    with sessions_lock:
+        if user_id in user_sessions:
+            history = user_sessions[user_id]["history"]
+            history.append({"role": role, "content": content})
+            # 限制历史长度
+            if len(history) > MAX_HISTORY_TURNS * 2:  # 每轮包含 user + assistant
+                user_sessions[user_id]["history"] = history[-(MAX_HISTORY_TURNS * 2):]
+            save_sessions()
+
+
+def build_prompt_with_history(user_id: str, current_message: str) -> str:
+    """构建带有历史上下文的提示词"""
+    if user_id not in user_sessions:
+        return current_message
+    
+    history = user_sessions[user_id]["history"]
+    if not history:
+        return current_message
+    
+    # 构建上下文提示（更明确的格式）
+    context_parts = [
+        "=== 对话上下文 ===",
+        "以下是我们刚才的对话，请基于这些上下文回答新问题：\n"
+    ]
+    
+    for msg in history:
+        if msg["role"] == "user":
+            context_parts.append(f"User: {msg['content']}")
+        else:
+            context_parts.append(f"Assistant: {msg['content']}")
+    
+    context_parts.append("\n=== 新消息 ===")
+    context_parts.append(f"User: {current_message}")
+    context_parts.append("\nAssistant:")
+    
+    return "\n".join(context_parts)
 
 
 # ============ Claude Code CLI ============
-def call_claude(prompt, cfg, session_id=None):
-    """调用 Claude Code CLI
-    
-    使用交互式 session 模式而不是 --print，避免 session 冲突
-    """
-    cmd = [
-        cfg["claude_cli"],
-        "--output-format", "text",
-        "--max-turns", str(cfg["max_turns"]),
-        "--dangerously-skip-permissions",
-    ]
-
-    # 使用 session 模式（不加 --print）
-    if session_id:
-        cmd.extend(["--session-id", session_id])
-
+def call_claude(messages, cfg):
+    """使用 Anthropic API 调用 Claude（支持真正的多轮对话）"""
     try:
-        kwargs = {}
-        if sys.platform == "win32":
-            kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
-        
-        # 使用 Popen 进行交互式输入输出
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=cfg["work_dir"],
-            **kwargs,
+        client = anthropic.Anthropic(
+            api_key=cfg.get("anthropic_api_key"),
+            base_url=cfg.get("anthropic_base_url", "https://api.anthropic.com")
         )
-        
-        # 发送提示词并关闭输入
-        stdout, stderr = proc.communicate(input=prompt.encode('utf-8'), timeout=cfg["task_timeout"])
-        
-        out = stdout.decode("utf-8", errors="replace").strip()
-        out = strip_ansi(out)
-        
-        # 检查 stderr 中的错误
-        if stderr:
-            err = stderr.decode("utf-8", errors="replace").strip()
-            # 检测 session 相关错误
-            if "already in use" in err or "Session ID" in err:
-                log(f"[claude] Session 错误: {err[:200]}", "warning")
-                return "__SESSION_ERROR__"
-            if "not found" in err.lower() and "session" in err.lower():
-                log(f"[claude] Session 不存在: {err[:200]}", "warning")
-                return "__SESSION_NOT_FOUND__"
-            if not out and err:
-                log(f"[claude] stderr: {err[:500]}", "error")
-                out = f"[stderr] {err[:300]}"
-        
-        if not out:
-            out = "(无输出)"
-        log(f"[claude] reply: {out[:100]}")
+
+        response = client.messages.create(
+            model=cfg.get("anthropic_model", "claude-opus-4-6"),
+            max_tokens=4096,
+            messages=messages
+        )
+
+        result = response.content[0].text
+        log(f"[claude-api] reply: {result[:100]}")
+
         max_len = cfg["max_output_length"]
-        return out[:max_len] + "\n...(截断)" if len(out) > max_len else out
-    except subprocess.TimeoutExpired:
-        log(f"[claude] 超时 ({cfg['task_timeout']}s)", "warning")
-        if 'proc' in locals():
-            proc.kill()
-        return f"⏰ 超时 ({cfg['task_timeout']}s)"
-    except FileNotFoundError:
-        log(f"[claude] 找不到命令: {cfg['claude_cli']}", "error")
-        return "❌ 找不到 claude 命令，请检查 CLAUDE_CLI 配置"
+        if len(result) > max_len:
+            return result[:max_len - 10] + "\n...(截断)"
+        return result
+
     except Exception as e:
-        log(f"[claude] 异常: {e}", "error")
-        return f"❌ {e}"
+        log(f"[claude-api] 错误: {e}", "error")
+        return f"❌ API 调用失败: {str(e)}"
 
 
 # ============ 发消息 ============
@@ -209,6 +224,17 @@ def reply_text(receive_id, rid_type, text):
     resp = client.im.v1.message.create(req)
     if not resp.success():
         log(f"[send] 失败: {resp.code} {resp.msg}", "error")
+        return None
+    return resp.data.message_id if resp.data else None
+
+
+def delete_message(message_id):
+    """删除消息"""
+    from lark_oapi.api.im.v1 import DeleteMessageRequest
+    req = DeleteMessageRequest.builder().message_id(message_id).build()
+    resp = client.im.v1.message.delete(req)
+    if not resp.success():
+        log(f"[delete] 失败: {resp.code} {resp.msg}", "error")
 
 
 # ============ 收消息 ============
@@ -258,7 +284,7 @@ def on_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
     log(f"[msg] {text[:80]}")
 
     # 检查特殊命令
-    if text.lower() in ["/reset", "/new", "/clear", "重置", "重新开始", "清除会话"]:
+    if text.lower() in ["/new", "/reset", "/clear", "重置", "重新开始", "清除会话"]:
         reset_session(user_id)
         reply_text(rid, rid_type, "✅ 已重置会话，开始新的对话")
         return
@@ -269,24 +295,32 @@ def on_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
             return
         task_running = True
 
+    processing_msg_id = None
     try:
-        # 获取或创建会话 ID
-        session_id = get_or_create_session(user_id)
+        # 获取或创建会话数据
+        get_or_create_session(user_id)
 
-        reply_text(rid, rid_type, "处理中...")
-        result = call_claude(text, _cfg, session_id=session_id)
-        
-        # 处理 session 错误
-        if result == "__SESSION_ERROR__":
-            log(f"[session] Session 错误，重置会话并重试")
-            session_id = reset_session(user_id)
-            result = call_claude(text, _cfg, session_id=session_id)
-        elif result == "__SESSION_NOT_FOUND__":
-            log(f"[session] Session 不存在，创建新会话并重试")
-            session_id = reset_session(user_id)
-            result = call_claude(text, _cfg, session_id=session_id)
-        
+        # 发送"处理中..."并保存 message_id
+        processing_msg_id = reply_text(rid, rid_type, "🤔 让我想想...")
+
+        # 构建消息数组（API 格式）
+        messages = []
+        if user_id in user_sessions:
+            messages = user_sessions[user_id]["history"].copy()
+
+        # 添加当前消息
+        messages.append({"role": "user", "content": text})
+
+        # 调用 Claude API
+        result = call_claude(messages, _cfg)
+
+        # 保存对话历史
+        add_to_history(user_id, "user", text)
+        add_to_history(user_id, "assistant", result)
+
+        # 发送结果
         reply_text(rid, rid_type, result)
+
         log(f"[done] {len(result)} 字")
     except Exception as e:
         reply_text(rid, rid_type, f"报错了: {e}")
